@@ -1,0 +1,950 @@
+import os
+import subprocess
+import sys
+import json
+import urllib.request
+import datetime
+import shutil
+import time
+import zipfile
+import io
+import re
+from pathlib import Path
+from functools import wraps
+from flask import Flask, request, render_template_string, redirect, url_for, session, flash, Response, jsonify, send_file
+
+# ================= CONFIGURATION =================
+ADMIN_USER = "xpert"
+ADMIN_PASS = "16164"
+SECRET_KEY = os.urandom(24)
+
+WG_DIR = "/etc/wireguard"
+DATA_FILE = f"{WG_DIR}/wg_manager_db.json"
+WG_MTU = 1280
+
+# Socat Config
+SOCAT_BIN = "/usr/bin/socat"
+SERVICE_DIR = "/etc/systemd/system"
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# ================= HTML TEMPLATE =================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WG Xpert Manager v13 (Fix Sys Client)</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f4f6f9; font-family: 'Segoe UI', sans-serif; font-size: 0.9rem; }
+        .sidebar { min-height: 100vh; background: #1e293b; color: #e2e8f0; }
+        .nav-link { color: #94a3b8; padding: 12px 20px; border-left: 3px solid transparent; transition: 0.2s; }
+        .nav-link:hover, .nav-link.active { color: #fff; background: #0f172a; border-left-color: #3b82f6; }
+        .card { border: none; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 1.5rem; }
+        .btn-action { width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+        pre { background: #1e293b; color: #4ade80; padding: 15px; border-radius: 6px; font-size: 0.8rem; }
+        .iface-select { background: #334155; color: white; border: 1px solid #475569; }
+        .iface-select:focus { background: #334155; color: white; border-color: #3b82f6; box-shadow: none; }
+    </style>
+</head>
+<body>
+
+{% if not session.logged_in %}
+    <div class="container d-flex justify-content-center align-items-center vh-100">
+        <div class="card p-4 shadow-lg" style="width: 360px;">
+            <div class="text-center mb-4">
+                <i class="fas fa-shield-alt fa-3x text-primary"></i>
+                <h4 class="mt-3 fw-bold">Xpert Login</h4>
+            </div>
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}<div class="alert alert-danger py-2 small">{{ messages[0] }}</div>{% endif %}
+            {% endwith %}
+            <form method="POST" action="/login">
+                <div class="mb-3"><input type="text" name="username" class="form-control" placeholder="Username" required></div>
+                <div class="mb-3"><input type="password" name="password" class="form-control" placeholder="Password" required></div>
+                <button type="submit" class="btn btn-primary w-100 fw-bold">LOGIN</button>
+            </form>
+        </div>
+    </div>
+{% else %}
+    <div class="d-flex">
+        <div class="sidebar d-none d-md-block" style="width: 250px;">
+            <div class="p-4 border-bottom border-secondary bg-dark">
+                <h6 class="mb-0 fw-bold text-white">WG MANAGER</h6>
+                <small class="text-white-50">FIX SYSTEM CLIENT v13</small>
+            </div>
+            <ul class="nav flex-column mt-3">
+                <li class="nav-item">
+                    <a href="/" class="nav-link {{ 'active' if active_page == 'dashboard' else '' }}">
+                        <i class="fas fa-tachometer-alt me-2"></i> Dashboard
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/forwarding" class="nav-link {{ 'active' if active_page == 'forwarding' else '' }}">
+                        <i class="fas fa-exchange-alt me-2"></i> Port Forwarding
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/maintenance" class="nav-link {{ 'active' if active_page == 'maintenance' else '' }}">
+                        <i class="fas fa-cogs me-2"></i> Maintenance
+                    </a>
+                </li>
+                <li class="nav-item"><a href="/logout" class="nav-link text-danger mt-5"><i class="fas fa-power-off me-2"></i> Logout</a></li>
+            </ul>
+        </div>
+
+        <div class="flex-grow-1 p-4">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <div>
+                    <h4 class="fw-bold m-0 text-dark">
+                        {% if active_page == 'dashboard' and current_iface %}
+                            <span class="text-primary">{{ current_iface }}</span>
+                        {% elif active_page == 'forwarding' %}
+                            Port Forwarding
+                        {% elif active_page == 'maintenance' %}
+                            Maintenance
+                        {% else %}
+                            Dashboard
+                        {% endif %}
+                    </h4>
+                </div>
+                
+                {% if active_page == 'dashboard' %}
+                <div class="d-flex gap-2">
+                    {% if all_ifaces %}
+                    <form action="/" method="GET">
+                        <select name="iface" class="form-select form-select-sm iface-select" onchange="this.form.submit()">
+                            {% for name in all_ifaces %}
+                            <option value="{{ name }}" {{ 'selected' if name == current_iface else '' }}>{{ name }}</option>
+                            {% endfor %}
+                        </select>
+                    </form>
+                    {% endif %}
+                    <button class="btn btn-sm btn-primary fw-bold" data-bs-toggle="modal" data-bs-target="#newInterfaceModal">
+                        <i class="fas fa-plus-circle me-1"></i> New Interface
+                    </button>
+                </div>
+                {% endif %}
+            </div>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category if category != 'message' else 'info' }} alert-dismissible fade show py-2 shadow-sm">
+                            {{ message }} <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                        </div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+
+            {% if active_page == 'dashboard' %}
+                {% if not current_iface %}
+                    <div class="text-center py-5">
+                        <i class="fas fa-server fa-4x text-muted mb-3"></i>
+                        <h4 class="text-muted">No Interfaces Yet</h4>
+                        <p>Create a new interface to start.</p>
+                        <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#newInterfaceModal">Create New Interface</button>
+                    </div>
+                {% else %}
+                    <div class="card bg-white">
+                        <div class="card-body">
+                            <div class="row align-items-center">
+                                <div class="col-md-8">
+                                    <div class="d-flex align-items-center gap-3">
+                                        <div class="bg-{{ 'success' if server_status else 'secondary' }} rounded-circle" style="width:12px;height:12px;"></div>
+                                        <h5 class="m-0 fw-bold {{ 'text-success' if server_status else 'text-secondary' }}">
+                                            {{ "RUNNING" if server_status else "STOPPED" }}
+                                        </h5>
+                                    </div>
+                                    <div class="text-muted small mt-1">
+                                        <i class="fas fa-globe me-1"></i> {{ public_ip }}:{{ port }} &nbsp;|&nbsp; 
+                                        <i class="fas fa-network-wired me-1"></i> {{ subnet }}
+                                    </div>
+                                </div>
+                                <div class="col-md-4 text-end">
+                                    <div class="btn-group">
+                                        <form method="POST" action="/toggle_server" class="d-inline">
+                                            <input type="hidden" name="iface" value="{{ current_iface }}">
+                                            <button class="btn btn-sm {{ 'btn-outline-danger' if server_status else 'btn-success' }} fw-bold">
+                                                <i class="fas fa-power-off me-1"></i> {{ "Matikan" if server_status else "Hidupkan" }}
+                                            </button>
+                                        </form>
+                                        <button class="btn btn-sm btn-outline-secondary" onclick="return confirm('Delete interface {{ current_iface }}?') ? window.location.href='/delete_interface/{{ current_iface }}' : false;">
+                                            <i class="fas fa-trash"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center border-bottom">
+                            <h6 class="mb-0 fw-bold">Client List</h6>
+                            <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addClientModal">
+                                <i class="fas fa-user-plus me-1"></i> Add Client
+                            </button>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table table-hover align-middle mb-0">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th class="ps-4">Status</th>
+                                        <th>Name</th>
+                                        <th>IP Address</th>
+                                        <th>Real Endpoint</th>
+                                        <th>Transfer</th>
+                                        <th>Last Seen</th>
+                                        <th class="text-end pe-4">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for peer in peers %}
+                                    <tr>
+                                        <td class="ps-4">
+                                            {% if peer.is_online %}
+                                                <span class="badge bg-success">ONLINE</span>
+                                            {% else %}
+                                                <span class="badge bg-secondary">OFFLINE</span>
+                                            {% endif %}
+                                        </td>
+                                        <td class="fw-bold text-primary">
+                                            {{ peer.name }}
+                                            {% if '_sys' in peer.name %}<span class="badge bg-info text-dark ms-1" style="font-size:0.6rem">SYSTEM</span>{% endif %}
+                                        </td>
+                                        <td><code>{{ peer.ip }}</code></td>
+                                        <td class="small text-muted">{{ peer.endpoint or "-" }}</td>
+                                        <td class="small">{{ peer.transfer_tx }} <i class="fas fa-arrow-up text-success" style="font-size:0.7em"></i><br>{{ peer.transfer_rx }} <i class="fas fa-arrow-down text-primary" style="font-size:0.7em"></i></td>
+                                        <td class="small text-muted">{{ peer.last_handshake_human }}</td>
+                                        <td class="text-end pe-4">
+                                            <div class="btn-group">
+                                                <button class="btn btn-outline-secondary btn-action" onclick="viewConfig('{{ peer.id|urlencode }}', '{{ peer.name }}')" title="View Config"><i class="fas fa-eye fa-xs"></i></button>
+                                                <a href="/download/{{ peer.id|urlencode }}?iface={{ current_iface }}" class="btn btn-outline-primary btn-action" title="Download"><i class="fas fa-download fa-xs"></i></a>
+                                                {% if '_sys' not in peer.name %}
+                                                <a href="/delete/{{ peer.id|urlencode }}?iface={{ current_iface }}" class="btn btn-outline-danger btn-action" onclick="return confirm('Hapus {{ peer.name }}?');" title="Delete"><i class="fas fa-trash fa-xs"></i></a>
+                                                {% endif %}
+                                            </div>
+                                        </td>
+                                    </tr>
+                                    {% else %}
+                                    <tr><td colspan="7" class="text-center py-4 text-muted">No clients yet.</td></tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                {% endif %}
+
+            {% elif active_page == 'forwarding' %}
+                <div class="card">
+                    <div class="card-header bg-white py-3">
+                        <h6 class="mb-0 fw-bold">Port Forwarding (Socat)</h6>
+                    </div>
+                    <div class="card-body">
+                        <form method="POST" action="/socat/create" class="row g-3 align-items-end mb-4 bg-light p-3 rounded border">
+                            <div class="col-md-3">
+                                <label class="form-label small fw-bold">Server Port (Listen)</label>
+                                <input name="port" type="number" class="form-control" placeholder="e.g 8080" required>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small fw-bold">Target IP</label>
+                                <input name="ip" type="text" class="form-control" placeholder="e.g 10.100.0.5" required>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label small fw-bold">Target Port</label>
+                                <input name="tport" type="number" class="form-control" placeholder="e.g 80" required>
+                            </div>
+                            <div class="col-md-2">
+                                <button type="submit" class="btn btn-primary w-100 fw-bold"><i class="fas fa-plus"></i> Add</button>
+                            </div>
+                        </form>
+
+                        <div class="table-responsive">
+                            <table class="table table-hover align-middle">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th>Listen Port</th>
+                                        <th>Target</th>
+                                        <th>Status</th>
+                                        <th class="text-end">Controls</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for port, status, target in socat_services %}
+                                    <tr>
+                                        <td class="fw-bold text-primary">{{ port }}</td>
+                                        <td><i class="fas fa-arrow-right me-2 text-muted"></i> {{ target }}</td>
+                                        <td>
+                                            <span class="badge {{ 'bg-success' if status=='running' else 'bg-danger' }}">{{ status.upper() }}</span>
+                                        </td>
+                                        <td class="text-end">
+                                            <div class="btn-group">
+                                                <a href="/socat/act/start/{{ port }}" class="btn btn-outline-success btn-action"><i class="fas fa-play fa-xs"></i></a>
+                                                <a href="/socat/act/restart/{{ port }}" class="btn btn-outline-warning btn-action"><i class="fas fa-sync fa-xs"></i></a>
+                                                <a href="/socat/act/stop/{{ port }}" class="btn btn-outline-secondary btn-action"><i class="fas fa-stop fa-xs"></i></a>
+                                                <a href="/socat/test/ping/{{ port }}" class="btn btn-outline-info btn-action"><i class="fas fa-network-wired fa-xs"></i></a>
+                                                <a href="/socat/delete/{{ port }}" class="btn btn-outline-danger btn-action" onclick="return confirm('Hapus rule ini?');"><i class="fas fa-trash fa-xs"></i></a>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                    {% else %}
+                                    <tr><td colspan="4" class="text-center text-muted py-4">No forwarding rules.</td></tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+            {% elif active_page == 'maintenance' %}
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="card border-primary h-100">
+                            <div class="card-header bg-primary text-white fw-bold">Backup & Restore</div>
+                            <div class="card-body">
+                                <h6 class="text-primary fw-bold">Download Data</h6>
+                                <p class="small text-muted mb-3">Save all Interfaces, Peers, and Socat rules.</p>
+                                <a href="/backup/download" class="btn btn-outline-primary w-100 mb-4"><i class="fas fa-download me-2"></i> Download Backup.zip</a>
+                                
+                                <hr>
+                                
+                                <h6 class="text-success fw-bold">Restore Data</h6>
+                                <form method="POST" action="/backup/restore" enctype="multipart/form-data" class="d-flex gap-2">
+                                    <input type="file" name="backup_file" class="form-control" required accept=".zip">
+                                    <button type="submit" class="btn btn-success">Restore</button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card border-danger h-100">
+                            <div class="card-header bg-danger text-white fw-bold">Factory Reset</div>
+                            <div class="card-body">
+                                <p class="text-danger fw-bold">Warning: Dangerous Area</p>
+                                <p class="small text-muted">This will delete ALL interfaces, clients, and rules.</p>
+                                <form method="POST" action="/factory_reset">
+                                    <button type="submit" class="btn btn-danger w-100" onclick="return confirm('ARE YOU SURE? THIS CANNOT BE UNDONE.');">RESET SYSTEM</button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% if test_result %}
+                <div class="card mt-3 bg-dark text-white">
+                    <div class="card-header py-2">Console Output</div>
+                    <div class="card-body p-0"><pre class="m-0 border-0 rounded-0">{{ test_result }}</pre></div>
+                </div>
+                {% endif %}
+            {% endif %}
+
+            <footer class="text-center text-muted small mt-5">WG Xpert Manager v13 &copy; 2025</footer>
+        </div>
+    </div>
+
+    <div class="modal fade" id="newInterfaceModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header"><h5 class="modal-title fw-bold">New VPN Interface</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                <form method="POST" action="/add_interface">
+                    <div class="modal-body">
+                        <div class="mb-3">
+                            <label class="form-label">Interface Name (Hotel/Loc)</label>
+                            <input type="text" name="iface_name" class="form-control" placeholder="e.g. wg-bali" required pattern="[a-z0-9_-]+" title="Lowercase, numbers, dash/underscore only">
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">UDP Port (Auto)</label>
+                                <input type="number" name="port" class="form-control fw-bold text-primary" value="{{ suggest_port }}" required min="1024" max="65000">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Gateway IP (Auto)</label>
+                                <input type="text" name="subnet" class="form-control fw-bold text-primary" value="{{ suggest_subnet }}" required pattern="^([0-9]{1,3}\.){3}[0-9]{1,3}$">
+                                <div class="form-text">Ends with .1</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer"><button type="submit" class="btn btn-primary w-100 fw-bold">Create & Auto Start</button></div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="addClientModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header"><h5 class="modal-title fw-bold">Add Client to {{ current_iface }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                <form method="POST" action="/add_client">
+                    <input type="hidden" name="iface" value="{{ current_iface }}">
+                    <div class="modal-body">
+                        <label class="form-label">Client Name</label>
+                        <input type="text" name="name" class="form-control" placeholder="user01" required pattern="[a-zA-Z0-9_-]+">
+                    </div>
+                    <div class="modal-footer"><button type="submit" class="btn btn-primary w-100">Add Client</button></div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="viewConfigModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header bg-light py-2"><h6 class="modal-title fw-bold" id="viewConfigTitle">Configuration</h6><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                <div class="modal-body p-0"><textarea id="configContent" class="form-control border-0 bg-dark text-success p-3" rows="15" readonly style="font-family:monospace;resize:none;font-size:0.85rem;"></textarea></div>
+                <div class="modal-footer py-1"><button class="btn btn-sm btn-success w-100" onclick="copyToClipboard()">Copy to Clipboard</button></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const currentIface = "{{ current_iface }}";
+        function viewConfig(id, name) {
+            document.getElementById('viewConfigTitle').innerText = name + ".conf";
+            document.getElementById('configContent').value = 'Generating config...';
+            new bootstrap.Modal(document.getElementById('viewConfigModal')).show();
+            fetch('/get_config/' + id + '?iface=' + currentIface).then(r => r.json()).then(d => { document.getElementById('configContent').value = d.config; });
+        }
+        function copyToClipboard() {
+            var c = document.getElementById("configContent");
+            c.select();
+            navigator.clipboard.writeText(c.value); alert("Copied!");
+        }
+    </script>
+{% endif %}
+</body>
+</html>
+"""
+
+# ================= HELPERS =================
+def run_cmd(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8').strip()
+    except subprocess.CalledProcessError as e:
+        return f"Error: {e.output.decode('utf-8')}"
+
+# Socat
+def svc_name(port): return f"socat-fwd-{port}.service"
+def svc_path(port): return Path(SERVICE_DIR) / svc_name(port)
+
+def list_socat_services():
+    try:
+        units = run_cmd("systemctl list-units --type=service --all --no-pager")
+        services = []
+        for l in units.splitlines():
+            if "socat-fwd-" in l:
+                parts = l.split()
+                name = parts[0]
+                port = name.replace("socat-fwd-", "").replace(".service", "")
+                status = "running" if "running" in l else "stopped"
+                target = "-"
+                p = svc_path(port)
+                if p.exists():
+                    for x in p.read_text().splitlines():
+                        if x.startswith("ExecStart") and "TCP:" in x: target = x.split("TCP:")[1]
+                services.append((port, status, target))
+        return sorted(services)
+    except: return []
+
+# WireGuard Keys & Time
+def get_public_ip():
+    try: return urllib.request.urlopen('https://api.ipify.org', timeout=2).read().decode('utf8')
+    except: return "127.0.0.1"
+
+def gen_keys():
+    p = run_cmd("wg genkey")
+    P = run_cmd(f"echo '{p}' | wg pubkey")
+    return p, P
+
+def human_bytes(B):
+    B = float(B)
+    KB = 1024
+    if B < KB: return f"{B} B"
+    if B < KB**2: return f"{B/KB:.2f} KB"
+    return f"{B/KB**2:.2f} MB"
+
+def time_ago(ts):
+    if ts == 0: return "Never"
+    sec = datetime.datetime.now().timestamp() - ts
+    if sec < 120: return "Just now"
+    if sec < 3600: return f"{int(sec/60)} mins ago"
+    if sec < 86400: return f"{int(sec/3600)} hours ago"
+    return f"{int(sec/86400)} days ago"
+
+# ================= DATABASE & DYNAMIC LOGIC =================
+def load_db():
+    if not os.path.exists(DATA_FILE):
+        save_db({})
+        return {}
+    try:
+        with open(DATA_FILE, "r") as f: return json.load(f)
+    except: return {}
+
+def save_db(data):
+    with open(DATA_FILE, "w") as f: json.dump(data, f, indent=4)
+
+def get_next_ip(subnet, used_ips):
+    base = ".".join(subnet.split(".")[:3])
+    for i in range(2, 254):
+        ip = f"{base}.{i}/32"
+        if ip not in used_ips: return ip
+    return None
+
+def create_interface(name, port, subnet_gw):
+    data = load_db()
+    if name in data: return False, "Name exists"
+    
+    # Check port overlap
+    for iface in data.values():
+        if str(iface['config']['port']) == str(port): return False, "Port used"
+        
+    priv, pub = gen_keys()
+    
+    base_ip = ".".join(subnet_gw.split(".")[:3])
+    sys_ip = f"{base_ip}.2/32"
+    priv_c, pub_c = gen_keys()
+    
+    # SANITIZE ID
+    safe_id = pub_c[:8].replace('/', '_').replace('+', '-')
+    
+    sys_peer = {
+        "id": safe_id,
+        "name": f"{name}_sys",
+        "private_key": priv_c,
+        "public_key": pub_c,
+        "ip": sys_ip,
+        "created_at": str(datetime.datetime.now())
+    }
+
+    data[name] = {
+        "config": {"port": port, "subnet": subnet_gw},
+        "server_priv": priv,
+        "server_pub": pub,
+        "peers": [sys_peer]
+    }
+    
+    save_db(data)
+    apply_wg_interface(name)
+    
+    res = run_cmd(f"wg-quick up {name}")
+    run_cmd(f"wg-quick up {name}_sys")
+    
+    if "Error:" in res:
+        return True, f"Interface created but failed to start: {res}"
+        
+    return True, "Success"
+
+def delete_interface_logic(name):
+    data = load_db()
+    if name not in data: return
+    
+    run_cmd(f"wg-quick down {name}_sys")
+    if name in run_cmd("ip link show"):
+        run_cmd(f"wg-quick down {name}")
+    
+    conf_path = f"{WG_DIR}/{name}.conf"
+    conf_sys_path = f"{WG_DIR}/{name}_sys.conf"
+    if os.path.exists(conf_path): os.remove(conf_path)
+    if os.path.exists(conf_sys_path): os.remove(conf_sys_path)
+    
+    del data[name]
+    save_db(data)
+
+def apply_wg_interface(iface_name):
+    data = load_db()
+    if iface_name not in data: return
+    
+    entry = data[iface_name]
+    cfg = entry['config']
+    gw = cfg['subnet']
+    port = cfg['port']
+    eth = run_cmd("ip -o -4 route show to default | awk '{print $5}'") or "eth0"
+    
+    # --- SERVER CONFIG ---
+    c = f"[Interface]\n# {iface_name}\nAddress = {gw}/24\nListenPort = {port}\nPrivateKey = {entry['server_priv']}\nMTU = {WG_MTU}\n"
+    c += f"PostUp = iptables -A FORWARD -i {iface_name} -j ACCEPT; iptables -t nat -A POSTROUTING -o {eth} -j MASQUERADE\n"
+    c += f"PostDown = iptables -D FORWARD -i {iface_name} -j ACCEPT; iptables -t nat -D POSTROUTING -o {eth} -j MASQUERADE\n"
+    
+    for p in entry['peers']:
+        c += f"\n[Peer]\n# {p['name']}\nPublicKey = {p['public_key']}\nAllowedIPs = {p['ip']}\n"
+        
+    with open(f"{WG_DIR}/{iface_name}.conf", "w") as f: f.write(c)
+    os.chmod(f"{WG_DIR}/{iface_name}.conf", 0o600)
+    
+    # --- CLIENT SYSTEM CONFIG (FIXED WITH TABLE=OFF) ---
+    sys_peer = next((p for p in entry['peers'] if '_sys' in p['name']), None)
+    if sys_peer:
+        subnet_range = ".".join(gw.split(".")[:3]) + ".0/24"
+        
+        # FIX: Tambahkan 'Table = off' agar tidak bentrok routing dengan interface server di mesin yang sama
+        c_sys = f"[Interface]\n# System Client for {iface_name}\nPrivateKey = {sys_peer['private_key']}\nAddress = {sys_peer['ip']}\nMTU = {WG_MTU}\nTable = off\n\n"
+        c_sys += f"[Peer]\nPublicKey = {entry['server_pub']}\nEndpoint = 127.0.0.1:{port}\nAllowedIPs = {subnet_range}\nPersistentKeepalive = 25\n"
+        
+        with open(f"{WG_DIR}/{iface_name}_sys.conf", "w") as f: f.write(c_sys)
+        os.chmod(f"{WG_DIR}/{iface_name}_sys.conf", 0o600)
+
+    # Sync server if running
+    if iface_name in run_cmd("ip link show"):
+        run_cmd(f"wg-quick strip {iface_name} > /tmp/wg_{iface_name}.conf")
+        run_cmd(f"wg syncconf {iface_name} /tmp/wg_{iface_name}.conf")
+
+def get_wg_stats(iface):
+    res = {}
+    try:
+        dump = run_cmd(f"wg show {iface} dump").splitlines()
+        for line in dump:
+            p = line.split('\t')
+            if len(p) > 6:
+                ts = int(p[4])
+                res[p[0]] = {
+                    'endpoint': p[2] if p[2] != '(none)' else None, 
+                    'rx': int(p[5]), 'tx': int(p[6]), 'ts': ts, 
+                    'online': (datetime.datetime.now().timestamp() - ts) < 180 if ts > 0 else False
+                }
+    except: pass
+    return res
+
+# ================= ROUTES =================
+def login_req(f):
+    @wraps(f)
+    def d(*args, **kwargs):
+        if not session.get('logged_in'): return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return d
+
+@app.route('/')
+@login_req
+def index():
+    data = load_db()
+    all_ifaces = list(data.keys())
+    
+    current_iface = request.args.get('iface')
+    if not current_iface and all_ifaces: current_iface = all_ifaces[0]
+    if current_iface and current_iface not in data: current_iface = None
+
+    peers_list = []
+    server_status = False
+    port = "-"
+    subnet = "-"
+    
+    used_ports = [int(v['config']['port']) for v in data.values()]
+    suggest_port = 51820
+    while suggest_port in used_ports: suggest_port += 1
+    
+    used_subnets = [v['config']['subnet'] for v in data.values()]
+    suggest_octet = 10
+    while f"10.{suggest_octet}.0.1" in used_subnets: suggest_octet += 1
+    suggest_subnet = f"10.{suggest_octet}.0.1"
+
+    if current_iface:
+        apply_wg_interface(current_iface)
+        server_status = current_iface in run_cmd("ip link show")
+        
+        # AUTO HEAL SYSTEM CLIENT
+        if server_status:
+            sys_iface = f"{current_iface}_sys"
+            if sys_iface not in run_cmd("ip link show"):
+                # Force UP with Table=off config
+                run_cmd(f"wg-quick up {sys_iface}")
+        
+        stats = get_wg_stats(current_iface)
+        entry = data[current_iface]
+        port = entry['config']['port']
+        subnet = entry['config']['subnet']
+        
+        for p in entry['peers']:
+            s = stats.get(p['public_key'], {})
+            peers_list.append({
+                **p, 
+                'endpoint': s.get('endpoint', '-'), 
+                'transfer_rx': human_bytes(s.get('rx',0)), 
+                'transfer_tx': human_bytes(s.get('tx',0)), 
+                'last_handshake_human': time_ago(s.get('ts',0)), 
+                'is_online': s.get('online',False)
+            })
+
+    return render_template_string(HTML_TEMPLATE, session=session, active_page='dashboard', 
+                                  current_iface=current_iface, all_ifaces=all_ifaces, 
+                                  peers=peers_list, server_status=server_status, 
+                                  public_ip=get_public_ip(), port=port, subnet=subnet,
+                                  suggest_port=suggest_port, suggest_subnet=suggest_subnet)
+
+@app.route('/add_interface', methods=['POST'])
+@login_req
+def route_add_iface():
+    name = request.form.get('iface_name').lower().strip()
+    port = request.form.get('port')
+    subnet = request.form.get('subnet')
+    
+    if not re.match(r'^[a-z0-9_-]+$', name):
+        flash("Invalid Name.", "danger")
+        return redirect(url_for('index'))
+        
+    ok, msg = create_interface(name, port, subnet)
+    if ok: 
+        if "GAGAL" in msg: flash(msg, "danger")
+        else: flash(f"Interface {name} created and STARTED.", "success")
+    else: flash(f"Failed: {msg}", "danger")
+    
+    return redirect(url_for('index', iface=name))
+
+@app.route('/delete_interface/<name>')
+@login_req
+def route_del_iface(name):
+    delete_interface_logic(name)
+    flash(f"Interface {name} deleted.", "warning")
+    return redirect(url_for('index'))
+
+@app.route('/toggle_server', methods=['POST'])
+@login_req
+def toggle_server():
+    iface = request.form.get('iface')
+    is_up = iface in run_cmd("ip link show")
+    
+    if is_up:
+        run_cmd(f"wg-quick down {iface}_sys")
+        res = run_cmd(f"wg-quick down {iface}")
+        if "Error:" in res: flash(f"Gagal mematikan: {res}", "danger")
+        else: flash(f"Interface {iface} dimatikan.", "warning")
+    else:
+        apply_wg_interface(iface)
+        res = run_cmd(f"wg-quick up {iface}")
+        run_cmd(f"wg-quick up {iface}_sys")
+        if "Error:" in res: flash(f"Gagal menghidupkan: {res}", "danger")
+        else: flash(f"Interface {iface} berhasil dihidupkan!", "success")
+            
+    return redirect(url_for('index', iface=iface))
+
+@app.route('/add_client', methods=['POST'])
+@login_req
+def route_add_client():
+    iface = request.form.get('iface')
+    name = request.form.get('name')
+    data = load_db()
+    
+    if iface not in data: return redirect(url_for('index'))
+    if any(p['name'] == name for p in data[iface]['peers']): 
+        flash("Name exists.", "danger")
+        return redirect(url_for('index', iface=iface))
+        
+    used = [p['ip'] for p in data[iface]['peers']]
+    next_ip = get_next_ip(data[iface]['config']['subnet'], used)
+    
+    priv, pub = gen_keys()
+    
+    safe_id = pub[:8].replace('/', '_').replace('+', '-')
+
+    data[iface]['peers'].append({
+        "id": safe_id, "name": name, "private_key": priv, "public_key": pub, 
+        "ip": next_ip, "created_at": str(datetime.datetime.now())
+    })
+    save_db(data)
+    apply_wg_interface(iface)
+    flash(f"Client {name} added.", "success")
+    return redirect(url_for('index', iface=iface))
+
+@app.route('/delete/<path:pid>')
+@login_req
+def route_del_peer(pid):
+    iface = request.args.get('iface')
+    data = load_db()
+    if iface in data:
+        data[iface]['peers'] = [p for p in data[iface]['peers'] if p['id'] != pid and "_sys" not in p['name']]
+        save_db(data)
+        apply_wg_interface(iface)
+        flash("Client deleted.", "warning")
+    return redirect(url_for('index', iface=iface))
+
+@app.route('/get_config/<path:pid>')
+@login_req
+def route_get_conf(pid):
+    iface = request.args.get('iface')
+    data = load_db()
+    if iface not in data: return jsonify({'config':'Err'})
+    peer = next((p for p in data[iface]['peers'] if p['id'] == pid), None)
+    if not peer: return jsonify({'config':'Not Found'})
+    
+    ep = "127.0.0.1" if "_sys" in peer['name'] else get_public_ip()
+    subnet = data[iface]['config']['subnet']
+    base_net = ".".join(subnet.split(".")[:3]) + ".0/24"
+    
+    c = f"[Interface]\nPrivateKey = {peer['private_key']}\nAddress = {peer['ip'].replace('/32','/24')}\nDNS = 8.8.8.8\nMTU = {WG_MTU}\n\n"
+    c += f"[Peer]\nPublicKey = {data[iface]['server_pub']}\nEndpoint = {ep}:{data[iface]['config']['port']}\nAllowedIPs = {base_net}\nPersistentKeepalive = 25"
+    return jsonify({'config':c})
+
+@app.route('/download/<path:pid>')
+@login_req
+def route_dl(pid):
+    iface = request.args.get('iface')
+    data = load_db()
+    peer = next((p for p in data.get(iface, {}).get('peers', []) if p['id'] == pid), None)
+    if not peer: return "Err", 404
+    
+    ep = "127.0.0.1" if "_sys" in peer['name'] else get_public_ip()
+    subnet = data[iface]['config']['subnet']
+    base_net = ".".join(subnet.split(".")[:3]) + ".0/24"
+    
+    c = f"[Interface]\nPrivateKey = {peer['private_key']}\nAddress = {peer['ip'].replace('/32','/24')}\nDNS = 8.8.8.8\nMTU = {WG_MTU}\n\n"
+    c += f"[Peer]\nPublicKey = {data[iface]['server_pub']}\nEndpoint = {ep}:{data[iface]['config']['port']}\nAllowedIPs = {base_net}\nPersistentKeepalive = 25"
+    return Response(c, mimetype='text/plain', headers={"Content-disposition":f"attachment; filename={peer['name']}.conf"})
+
+@app.route('/forwarding')
+@login_req
+def forwarding():
+    return render_template_string(HTML_TEMPLATE, session=session, active_page='forwarding', socat_services=list_socat_services())
+
+@app.route('/maintenance')
+@login_req
+def maintenance():
+    res = request.args.get('res', '')
+    return render_template_string(HTML_TEMPLATE, session=session, active_page='maintenance', test_result=res)
+
+@app.route('/backup/download')
+@login_req
+def backup_download():
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as zf:
+        if os.path.exists(DATA_FILE): zf.write(DATA_FILE, "wg_manager_db.json")
+        socat_data = []
+        for port, _, target in list_socat_services():
+            if target and "TCP:" in target:
+                clean = target.split("TCP:")[1]
+                parts = clean.split(":")
+                if len(parts) >= 2: socat_data.append({"port": port, "ip": parts[0], "tport": parts[1]})
+        zf.writestr("socat_config.json", json.dumps(socat_data, indent=4))
+    mem.seek(0)
+    return send_file(mem, as_attachment=True, download_name=f"wg_full_backup_{int(time.time())}.zip")
+
+@app.route('/backup/restore', methods=['POST'])
+@login_req
+def backup_restore():
+    if 'backup_file' not in request.files: return redirect(url_for('maintenance'))
+    file = request.files['backup_file']
+    if not file.filename: return redirect(url_for('maintenance'))
+    try:
+        with zipfile.ZipFile(file, 'r') as zf:
+            if "wg_manager_db.json" in zf.namelist():
+                curr = load_db()
+                for i in curr: 
+                    run_cmd(f"wg-quick down {i}_sys")
+                    if i in run_cmd("ip link show"): run_cmd(f"wg-quick down {i}")
+                with open(DATA_FILE, "wb") as f: f.write(zf.read("wg_manager_db.json"))
+                new_db = load_db()
+                for i in new_db:
+                    apply_wg_interface(i)
+                    run_cmd(f"wg-quick up {i}")
+                    run_cmd(f"wg-quick up {i}_sys")
+            if "socat_config.json" in zf.namelist():
+                for s in list_socat_services():
+                    run_cmd(f"systemctl disable --now {svc_name(s[0])}")
+                    svc_path(s[0]).unlink(missing_ok=True)
+                run_cmd("systemctl daemon-reload")
+                for s in json.loads(zf.read("socat_config.json")):
+                    port, ip, tport = s['port'], s['ip'], s['tport']
+                    svc_path(port).write_text(f"[Unit]\nDescription=Socat\n[Service]\nExecStart={SOCAT_BIN} TCP-LISTEN:{port},fork TCP:{ip}:{tport}\nRestart=always\n[Install]\nWantedBy=multi-user.target")
+                    run_cmd(f"systemctl enable --now {svc_name(port)}")
+                    run_cmd(f"ufw allow {port}/tcp")
+        flash("Restore Complete.", "success")
+    except Exception as e: flash(str(e), "danger")
+    return redirect(url_for('maintenance'))
+
+@app.route('/factory_reset', methods=['POST'])
+@login_req
+def factory_reset():
+    data = load_db()
+    for i in data:
+        run_cmd(f"wg-quick down {i}_sys")
+        if i in run_cmd("ip link show"): run_cmd(f"wg-quick down {i}")
+        if os.path.exists(f"{WG_DIR}/{i}.conf"): os.remove(f"{WG_DIR}/{i}.conf")
+        if os.path.exists(f"{WG_DIR}/{i}_sys.conf"): os.remove(f"{WG_DIR}/{i}_sys.conf")
+    if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
+    for s in list_socat_services():
+        run_cmd(f"systemctl disable --now {svc_name(s[0])}")
+        svc_path(s[0]).unlink(missing_ok=True)
+        run_cmd(f"ufw delete allow {s[0]}/tcp")
+    flash("Factory Reset Complete.", "success")
+    return redirect(url_for('index'))
+
+@app.route('/socat/create', methods=['POST'])
+@login_req
+def socat_create():
+    try:
+        port = int(request.form['port'])
+        ip = request.form['ip']
+        tport = int(request.form['tport'])
+    except:
+        flash("Input Error.", "danger"); return redirect(url_for('forwarding'))
+
+    p = svc_path(port)
+    if p.exists():
+        flash("Port Socat already busy.", "danger")
+        return redirect(url_for('forwarding'))
+
+    wg_data = load_db()
+    for iface_name, data in wg_data.items():
+        if int(data['config']['port']) == port:
+            flash(f"ERROR: Port {port} is used by WireGuard Interface '{iface_name}'. Conflict detected!", "danger")
+            return redirect(url_for('forwarding'))
+
+    p.write_text(f"[Unit]\nDescription=Socat {port}\nAfter=network.target\n[Service]\nExecStart={SOCAT_BIN} TCP-LISTEN:{port},fork TCP:{ip}:{tport}\nRestart=always\nRestartSec=3\n[Install]\nWantedBy=multi-user.target")
+    run_cmd("systemctl daemon-reload")
+    run_cmd(f"systemctl enable --now {svc_name(port)}")
+    run_cmd(f"ufw allow {port}/tcp")
+    flash("Rule created.", "success")
+    return redirect(url_for('forwarding'))
+
+@app.route('/socat/delete/<port>')
+@login_req
+def socat_del(port):
+    run_cmd(f"systemctl disable --now {svc_name(port)}")
+    svc_path(port).unlink(missing_ok=True)
+    run_cmd("systemctl daemon-reload")
+    run_cmd(f"ufw delete allow {port}/tcp")
+    return redirect(url_for('forwarding'))
+
+@app.route('/socat/act/<cmd>/<port>')
+@login_req
+def socat_act(cmd, port):
+    run_cmd(f"systemctl {cmd} {svc_name(port)}")
+    return redirect(url_for('forwarding'))
+
+@app.route('/socat/test/ping/<port>')
+@login_req
+def socat_ping(port):
+    t = "-"
+    p = svc_path(port)
+    if p.exists():
+        for x in p.read_text().splitlines():
+            if "TCP:" in x: t = x.split("TCP:")[1].split(":")[0]
+    res = run_cmd(f"ping -c 3 -W 1 {t}")
+    return redirect(url_for('maintenance', res=res))
+
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if request.method=='POST':
+        if request.form.get('username')==ADMIN_USER and request.form.get('password')==ADMIN_PASS:
+            session['logged_in']=True
+            return redirect(url_for('index'))
+        flash("Wrong credentials.")
+    return render_template_string(HTML_TEMPLATE, session=session)
+
+@app.route('/logout')
+def logout(): session.clear(); return redirect(url_for('login'))
+
+if __name__ == '__main__':
+    if os.geteuid() != 0: sys.exit("Run as ROOT!")
+    if not os.path.exists(WG_DIR): os.makedirs(WG_DIR)
+    
+    db = load_db()
+    for iface in db:
+        apply_wg_interface(iface)
+        if iface not in run_cmd("ip link show"):
+            run_cmd(f"wg-quick up {iface}")
+            # Ensure client sys is also up (now with Table=off)
+            run_cmd(f"wg-quick up {iface}_sys")
+            
+    print(f"Panel running on http://{get_public_ip()}:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False)
