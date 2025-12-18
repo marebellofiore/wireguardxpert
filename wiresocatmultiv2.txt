@@ -36,7 +36,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WG Xpert Manager v13 (Fix Sys Client)</title>
+    <title>WG Xpert Manager v13 (Fixed Routing)</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -75,7 +75,7 @@ HTML_TEMPLATE = """
         <div class="sidebar d-none d-md-block" style="width: 250px;">
             <div class="p-4 border-bottom border-secondary bg-dark">
                 <h6 class="mb-0 fw-bold text-white">WG MANAGER</h6>
-                <small class="text-white-50">FIX SYSTEM CLIENT v13</small>
+                <small class="text-white-50">FIXED ROUTING v13</small>
             </div>
             <ul class="nav flex-column mt-3">
                 <li class="nav-item">
@@ -563,10 +563,11 @@ def apply_wg_interface(iface_name):
     port = cfg['port']
     eth = run_cmd("ip -o -4 route show to default | awk '{print $5}'") or "eth0"
     
-    # --- SERVER CONFIG ---
+    # --- SERVER CONFIG (FIXED FOR ROUTING) ---
+    # Perbaikan: Menambahkan aturan Forwarding untuk IN dan OUT pada interface WG
     c = f"[Interface]\n# {iface_name}\nAddress = {gw}/24\nListenPort = {port}\nPrivateKey = {entry['server_priv']}\nMTU = {WG_MTU}\n"
-    c += f"PostUp = iptables -A FORWARD -i {iface_name} -j ACCEPT; iptables -t nat -A POSTROUTING -o {eth} -j MASQUERADE\n"
-    c += f"PostDown = iptables -D FORWARD -i {iface_name} -j ACCEPT; iptables -t nat -D POSTROUTING -o {eth} -j MASQUERADE\n"
+    c += f"PostUp = iptables -A FORWARD -i {iface_name} -j ACCEPT; iptables -A FORWARD -o {iface_name} -j ACCEPT; iptables -t nat -A POSTROUTING -o {eth} -j MASQUERADE\n"
+    c += f"PostDown = iptables -D FORWARD -i {iface_name} -j ACCEPT; iptables -D FORWARD -o {iface_name} -j ACCEPT; iptables -t nat -D POSTROUTING -o {eth} -j MASQUERADE\n"
     
     for p in entry['peers']:
         c += f"\n[Peer]\n# {p['name']}\nPublicKey = {p['public_key']}\nAllowedIPs = {p['ip']}\n"
@@ -937,6 +938,10 @@ def logout(): session.clear(); return redirect(url_for('login'))
 if __name__ == '__main__':
     if os.geteuid() != 0: sys.exit("Run as ROOT!")
     if not os.path.exists(WG_DIR): os.makedirs(WG_DIR)
+    
+    # CRITICAL FIX: ENABLE IP FORWARDING
+    print("Enabling IPv4 Forwarding...")
+    run_cmd("sysctl -w net.ipv4.ip_forward=1")
     
     db = load_db()
     for iface in db:
