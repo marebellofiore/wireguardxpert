@@ -1,0 +1,528 @@
+import os
+import subprocess
+import sys
+import json
+import urllib.request
+import datetime
+import shutil
+import time
+from functools import wraps
+from flask import Flask, request, render_template_string, redirect, url_for, session, flash, Response, jsonify
+
+# ================= CONFIGURATION =================
+ADMIN_USER = "xpert"
+ADMIN_PASS = "16164"
+SECRET_KEY = os.urandom(24)
+
+INTERFACE_NAME = "wgxpert"        # Interface Server
+LOCAL_CLIENT_NAME = "wgxpert1"    # Interface Client Local (Loopback)
+WG_DIR = "/etc/wireguard"
+DATA_FILE = f"{WG_DIR}/peers.json"
+BACKUP_DIR = f"{WG_DIR}/backups"
+SERVER_PORT = 51820
+SERVER_VPN_IP = "10.100.0.1"
+WG_MTU = 1280
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# ================= HTML TEMPLATE =================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WG Xpert Ultimate v5</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; font-family: 'Segoe UI', sans-serif; }
+        .sidebar { min-height: 100vh; background: #212529; color: white; }
+        .nav-link { color: #adb5bd; padding: 12px 20px; border-left: 3px solid transparent; }
+        .nav-link:hover, .nav-link.active { color: #fff; background: #343a40; border-left-color: #0d6efd; }
+        .card { border: none; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .btn-action { width: 32px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+        pre { background: #212529; color: #0f0; padding: 15px; border-radius: 4px; font-size: 0.85rem; }
+    </style>
+</head>
+<body>
+
+{% if not session.logged_in %}
+    <div class="container d-flex justify-content-center align-items-center vh-100">
+        <div class="card p-4 shadow" style="width: 350px;">
+            <div class="text-center mb-3">
+                <i class="fas fa-lock fa-3x text-primary"></i>
+                <h4 class="mt-2">Login System</h4>
+            </div>
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}<div class="alert alert-danger py-1 small">{{ messages[0] }}</div>{% endif %}
+            {% endwith %}
+            <form method="POST" action="/login">
+                <div class="mb-3"><input type="text" name="username" class="form-control" placeholder="Username" required></div>
+                <div class="mb-3"><input type="password" name="password" class="form-control" placeholder="Password" required></div>
+                <button type="submit" class="btn btn-primary w-100">MASUK</button>
+            </form>
+        </div>
+    </div>
+{% else %}
+    <div class="d-flex">
+        <div class="sidebar d-none d-md-block" style="width: 240px;">
+            <div class="p-4 border-bottom border-secondary">
+                <h5 class="mb-0 fw-bold">WG MANAGER</h5>
+                <small class="text-white-50">ULTIMATE EDITION</small>
+            </div>
+            <ul class="nav flex-column mt-3">
+                <li class="nav-item"><a href="/" class="nav-link {{ 'active' if active_page == 'dashboard' else '' }}"><i class="fas fa-home me-2"></i> Dashboard</a></li>
+                <li class="nav-item"><a href="/maintenance" class="nav-link {{ 'active' if active_page == 'maintenance' else '' }}"><i class="fas fa-cogs me-2"></i> Maintenance</a></li>
+                <li class="nav-item"><a href="/logout" class="nav-link text-danger mt-5"><i class="fas fa-sign-out-alt me-2"></i> Logout</a></li>
+            </ul>
+        </div>
+
+        <div class="flex-grow-1 p-4">
+            <div class="d-md-none mb-3 d-flex justify-content-between bg-white p-3 rounded shadow-sm">
+                <b>WG Manager</b> <a href="/logout" class="text-danger">Logout</a>
+            </div>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category if category != 'message' else 'info' }} alert-dismissible fade show">
+                            {{ message }} <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                        </div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+
+            {% if active_page == 'dashboard' %}
+                <div class="card bg-white mb-4">
+                    <div class="card-body d-flex justify-content-between align-items-center">
+                        <div>
+                            <h6 class="text-muted text-uppercase fw-bold mb-1">Status Interface</h6>
+                            <h3 class="{{ 'text-success' if server_status else 'text-secondary' }} fw-bold">
+                                {{ "● AKTIF" if server_status else "○ NON-AKTIF" }}
+                            </h3>
+                            <small class="text-muted">{{ public_ip }}:{{ port }} ({{ interface }})</small>
+                        </div>
+                        <form method="POST" action="/toggle_server">
+                            <button class="btn {{ 'btn-outline-danger' if server_status else 'btn-success' }}">
+                                <i class="fas fa-power-off me-1"></i> {{ "Matikan" if server_status else "Hidupkan" }}
+                            </button>
+                        </form>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0 fw-bold">Daftar Client</h5>
+                        <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addClientModal">
+                            <i class="fas fa-plus me-1"></i> Tambah
+                        </button>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-hover align-middle mb-0">
+                            <thead class="table-light">
+                                <tr>
+                                    <th class="ps-4">Status</th>
+                                    <th>Nama</th>
+                                    <th>IP VPN</th>
+                                    <th>Endpoint Asli</th>
+                                    <th>Total Data</th>
+                                    <th>Handshake</th>
+                                    <th class="text-end pe-4">Aksi</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for peer in peers %}
+                                <tr>
+                                    <td class="ps-4">
+                                        <span class="badge {{ 'bg-success' if peer.is_online else 'bg-secondary' }}">
+                                            {{ "ONLINE" if peer.is_online else "OFFLINE" }}
+                                        </span>
+                                    </td>
+                                    <td class="fw-bold">
+                                        {{ peer.name }}
+                                        {% if peer.name == local_client_name %}<span class="badge bg-info text-dark ms-1">SYSTEM</span>{% endif %}
+                                    </td>
+                                    <td><code>{{ peer.ip }}</code></td>
+                                    <td class="small text-muted">{{ peer.endpoint or "-" }}</td>
+                                    <td class="small">{{ peer.transfer_tx }} / {{ peer.transfer_rx }}</td>
+                                    <td class="small text-muted">{{ peer.last_handshake_human }}</td>
+                                    <td class="text-end pe-4">
+                                        <div class="btn-group">
+                                            <button class="btn btn-sm btn-outline-primary btn-action" onclick="viewConfig('{{ peer.id }}', '{{ peer.name }}')" title="Lihat"><i class="fas fa-eye"></i></button>
+                                            <a href="/download/{{ peer.id }}" class="btn btn-sm btn-outline-success btn-action" title="Download"><i class="fas fa-download"></i></a>
+                                            {% if peer.name != local_client_name %}
+                                            <a href="/delete/{{ peer.id }}" class="btn btn-sm btn-outline-danger btn-action" onclick="return confirm('Hapus {{ peer.name }}?');" title="Hapus"><i class="fas fa-trash"></i></a>
+                                            {% endif %}
+                                        </div>
+                                    </td>
+                                </tr>
+                                {% else %}
+                                <tr><td colspan="7" class="text-center py-4 text-muted">Data kosong.</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+            {% elif active_page == 'maintenance' %}
+                <div class="alert alert-warning border-warning">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    <strong>Zona Berbahaya:</strong> Fitur di bawah ini untuk perbaikan sistem.
+                </div>
+                
+                <div class="row g-4">
+                    <div class="col-md-12">
+                        <div class="card border-danger">
+                            <div class="card-header bg-danger text-white fw-bold">
+                                <i class="fas fa-bomb me-2"></i>FACTORY RESET (HAPUS SEMUA)
+                            </div>
+                            <div class="card-body">
+                                <h5 class="card-title text-danger">Mulai Ulang Dari Nol</h5>
+                                <p class="card-text">Tombol ini akan <strong>MENGHAPUS SEMUA CONFIG & DATABASE</strong>. Masalah config nyangkut, dewa error, dll akan hilang. Script akan membuat ulang config fresh.</p>
+                                <form method="POST" action="/factory_reset">
+                                    <button type="submit" class="btn btn-danger btn-lg w-100" onclick="return confirm('ANDA YAKIN? Semua client akan dihapus permanen! Tidak bisa dibatalkan.');">
+                                        <i class="fas fa-trash-alt me-2"></i> Lakukan Factory Reset
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="col-md-6">
+                        <div class="card h-100">
+                            <div class="card-header fw-bold"><i class="fas fa-sync me-2"></i>Force Restart Interface</div>
+                            <div class="card-body">
+                                <p class="small">Matikan paksa interface dan nyalakan lagi berdasarkan database saat ini.</p>
+                                <form method="POST" action="/force_restart">
+                                    <button class="btn btn-warning w-100">Restart Interface</button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="col-md-6">
+                         <div class="card h-100">
+                            <div class="card-header fw-bold"><i class="fas fa-database me-2"></i>Debug Database</div>
+                            <div class="card-body">
+                                <p class="small">Isi raw file peers.json saat ini:</p>
+                                <div style="max-height: 100px; overflow-y: auto; background: #eee; padding:5px;">
+                                    <code>{{ raw_db }}</code>
+                                </div>
+                            </div>
+                         </div>
+                    </div>
+                </div>
+            {% endif %}
+
+            <footer class="text-center text-muted small mt-5">WG Xpert Manager v5 &copy; 2025</footer>
+        </div>
+    </div>
+
+    <div class="modal fade" id="addClientModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header"><h5 class="modal-title fw-bold">Tambah Client</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                <form method="POST" action="/add_client">
+                    <div class="modal-body">
+                        <div class="mb-3"><label class="form-label">Nama</label><input type="text" name="name" class="form-control" placeholder="user_baru" required pattern="[a-zA-Z0-9_-]+"></div>
+                    </div>
+                    <div class="modal-footer"><button type="submit" class="btn btn-primary">Simpan</button></div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="viewConfigModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header bg-light"><h5 class="modal-title fw-bold" id="viewConfigTitle">Config</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                <div class="modal-body p-0"><textarea id="configContent" class="form-control border-0 bg-dark text-white p-4" rows="12" readonly style="font-family:monospace;resize:none;"></textarea></div>
+                <div class="modal-footer"><button class="btn btn-success" onclick="copyToClipboard()">Salin</button></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function viewConfig(id, name) {
+            document.getElementById('viewConfigTitle').innerText = name;
+            document.getElementById('configContent').value = 'Loading...';
+            new bootstrap.Modal(document.getElementById('viewConfigModal')).show();
+            fetch('/get_config/' + id).then(r => r.json()).then(d => { document.getElementById('configContent').value = d.config; });
+        }
+        function copyToClipboard() {
+            var c = document.getElementById("configContent"); c.select();
+            navigator.clipboard.writeText(c.value); alert("Disalin!");
+        }
+    </script>
+{% endif %}
+</body>
+</html>
+"""
+
+# ================= SYSTEM LOGIC =================
+
+def run_cmd(cmd):
+    try: return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8').strip()
+    except subprocess.CalledProcessError: return ""
+
+def get_public_ip():
+    try: return urllib.request.urlopen('https://api.ipify.org', timeout=2).read().decode('utf8')
+    except: return "127.0.0.1"
+
+def gen_keys():
+    p = run_cmd("wg genkey")
+    P = run_cmd(f"echo '{p}' | wg pubkey")
+    return p, P
+
+def human_bytes(B):
+    B = float(B)
+    KB = 1024
+    if B < KB: return f"{B} B"
+    if B < KB**2: return f"{B/KB:.2f} KB"
+    return f"{B/KB**2:.2f} MB"
+
+def time_ago(ts):
+    if ts == 0: return "Never"
+    sec = datetime.datetime.now().timestamp() - ts
+    if sec < 120: return "Baru saja"
+    if sec < 3600: return f"{int(sec/60)} menit lalu"
+    if sec < 86400: return f"{int(sec/3600)} jam lalu"
+    return f"{int(sec/86400)} hari lalu"
+
+# --- DB & RESET ---
+def init_db():
+    # Jika file tidak ada, buat baru + server key + local client
+    if not os.path.exists(DATA_FILE):
+        priv, pub = gen_keys()
+        data = {"server_priv": priv, "server_pub": pub, "peers": []}
+        with open(DATA_FILE, "w") as f: json.dump(data, f, indent=4)
+        add_peer(LOCAL_CLIENT_NAME)
+        return load_db()
+    
+    # Cek integritas JSON
+    try:
+        with open(DATA_FILE, "r") as f: return json.load(f)
+    except:
+        # JSON Rusak? Reset otomatis
+        if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
+        return init_db()
+
+def load_db():
+    return init_db()
+
+def save_db(data):
+    with open(DATA_FILE, "w") as f: json.dump(data, f, indent=4)
+
+def add_peer(name):
+    data = load_db()
+    if any(p['name'] == name for p in data['peers']): return False
+    
+    # Cari IP kosong
+    used = [int(p['ip'].split('.')[-1].split('/')[0]) for p in data['peers']]
+    next_ip = None
+    for i in range(2, 254):
+        if i not in used:
+            next_ip = f"10.100.0.{i}/32"
+            break
+    if not next_ip: return False
+
+    priv, pub = gen_keys()
+    data['peers'].append({
+        "id": pub[:8], "name": name, "private_key": priv, "public_key": pub, 
+        "ip": next_ip, "created_at": str(datetime.datetime.now())
+    })
+    save_db(data)
+    apply_wg()
+    return True
+
+def delete_peer(peer_id):
+    data = load_db()
+    # Jangan hapus local client via tombol biasa
+    data['peers'] = [p for p in data['peers'] if p['id'] != peer_id and p['name'] != LOCAL_CLIENT_NAME]
+    save_db(data)
+    apply_wg()
+    return True
+
+def factory_reset_logic():
+    # 1. Matikan interface
+    run_cmd(f"wg-quick down {INTERFACE_NAME}")
+    run_cmd(f"wg-quick down {LOCAL_CLIENT_NAME}")
+    
+    # 2. Hapus file
+    if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
+    if os.path.exists(f"{WG_DIR}/{INTERFACE_NAME}.conf"): os.remove(f"{WG_DIR}/{INTERFACE_NAME}.conf")
+    if os.path.exists(f"{WG_DIR}/{LOCAL_CLIENT_NAME}.conf"): os.remove(f"{WG_DIR}/{LOCAL_CLIENT_NAME}.conf")
+    
+    # 3. Init ulang (akan otomatis create keys baru & local client)
+    init_db()
+    apply_wg()
+
+# --- WIREGUARD CONFIG ---
+def apply_wg():
+    data = load_db()
+    eth = run_cmd("ip -o -4 route show to default | awk '{print $5}'") or "eth0"
+
+    # Server Conf
+    conf = f"""[Interface]
+Address = {SERVER_VPN_IP}/24
+ListenPort = {SERVER_PORT}
+PrivateKey = {data['server_priv']}
+MTU = {WG_MTU}
+PostUp = iptables -A FORWARD -i {INTERFACE_NAME} -j ACCEPT; iptables -t nat -A POSTROUTING -o {eth} -j MASQUERADE
+PostDown = iptables -D FORWARD -i {INTERFACE_NAME} -j ACCEPT; iptables -t nat -D POSTROUTING -o {eth} -j MASQUERADE
+"""
+    for p in data['peers']:
+        conf += f"\n[Peer]\n# {p['name']}\nPublicKey = {p['public_key']}\nAllowedIPs = {p['ip']}\n"
+    
+    with open(f"{WG_DIR}/{INTERFACE_NAME}.conf", "w") as f: f.write(conf)
+    os.chmod(f"{WG_DIR}/{INTERFACE_NAME}.conf", 0o600)
+
+    # Local Client Conf
+    local = next((p for p in data['peers'] if p['name'] == LOCAL_CLIENT_NAME), None)
+    if local:
+        l_conf = f"[Interface]\nPrivateKey = {local['private_key']}\nAddress = {local['ip'].replace('/32','/24')}\nMTU = {WG_MTU}\n[Peer]\nPublicKey = {data['server_pub']}\nEndpoint = 127.0.0.1:{SERVER_PORT}\nAllowedIPs = 10.100.0.0/24\nPersistentKeepalive = 25"
+        with open(f"{WG_DIR}/{LOCAL_CLIENT_NAME}.conf", "w") as f: f.write(l_conf)
+        os.chmod(f"{WG_DIR}/{LOCAL_CLIENT_NAME}.conf", 0o600)
+
+    # Reload / Start
+    if INTERFACE_NAME in run_cmd("ip link show"):
+        run_cmd(f"wg-quick strip {INTERFACE_NAME} > /tmp/wg.conf")
+        run_cmd(f"wg syncconf {INTERFACE_NAME} /tmp/wg.conf")
+        if local and LOCAL_CLIENT_NAME not in run_cmd("ip link show"):
+             run_cmd(f"wg-quick up {LOCAL_CLIENT_NAME}")
+    else:
+        run_cmd(f"wg-quick up {INTERFACE_NAME}")
+        if local: run_cmd(f"wg-quick up {LOCAL_CLIENT_NAME}")
+
+def get_stats():
+    res = {}
+    try:
+        dump = run_cmd(f"wg show {INTERFACE_NAME} dump").splitlines()
+        for line in dump:
+            p = line.split('\t')
+            if len(p) > 6:
+                ts = int(p[4])
+                res[p[0]] = {
+                    'endpoint': p[2] if p[2] != '(none)' else None,
+                    'rx': int(p[5]), 'tx': int(p[6]), 'ts': ts,
+                    'online': (datetime.datetime.now().timestamp() - ts) < 180 if ts > 0 else False
+                }
+    except: pass
+    return res
+
+# ================= ROUTES =================
+def login_req(f):
+    @wraps(f)
+    def d(*args, **kwargs):
+        if not session.get('logged_in'): return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return d
+
+@app.route('/')
+@login_req
+def index():
+    data = load_db()
+    apply_wg() # Ensure running
+    stats = get_stats()
+    peers = []
+    for p in data['peers']:
+        s = stats.get(p['public_key'], {})
+        peers.append({
+            **p,
+            'endpoint': s.get('endpoint', '-'),
+            'transfer_rx': human_bytes(s.get('rx',0)), 'transfer_tx': human_bytes(s.get('tx',0)),
+            'last_handshake_human': time_ago(s.get('ts',0)), 'is_online': s.get('online',False)
+        })
+    raw_db = json.dumps(data, indent=2) if request.args.get('debug') else ""
+    return render_template_string(HTML_TEMPLATE, session=session, active_page='dashboard',
+        peers=peers, server_status=(INTERFACE_NAME in run_cmd("ip link show")),
+        public_ip=get_public_ip(), port=SERVER_PORT, interface=INTERFACE_NAME, local_client_name=LOCAL_CLIENT_NAME)
+
+@app.route('/maintenance')
+@login_req
+def maintenance():
+    with open(DATA_FILE, "r") as f: raw = f.read()
+    return render_template_string(HTML_TEMPLATE, session=session, active_page='maintenance', raw_db=raw)
+
+@app.route('/factory_reset', methods=['POST'])
+@login_req
+def factory_reset():
+    factory_reset_logic()
+    flash("Sistem berhasil di-RESET TOTAL. Semua data baru.", "success")
+    return redirect(url_for('index'))
+
+@app.route('/force_restart', methods=['POST'])
+@login_req
+def force_restart():
+    run_cmd(f"wg-quick down {INTERFACE_NAME}")
+    run_cmd(f"wg-quick down {LOCAL_CLIENT_NAME}")
+    time.sleep(1)
+    apply_wg()
+    flash("Interface direstart paksa.", "success")
+    return redirect(url_for('maintenance'))
+
+@app.route('/toggle_server', methods=['POST'])
+@login_req
+def toggle_server():
+    if INTERFACE_NAME in run_cmd("ip link show"):
+        run_cmd(f"wg-quick down {INTERFACE_NAME}")
+        run_cmd(f"wg-quick down {LOCAL_CLIENT_NAME}")
+    else: apply_wg()
+    return redirect(url_for('index'))
+
+@app.route('/add_client', methods=['POST'])
+@login_req
+def route_add():
+    if add_peer(request.form.get('name')): flash("Berhasil.", "success")
+    else: flash("Gagal (Nama ada/Error).", "danger")
+    return redirect(url_for('index'))
+
+@app.route('/delete/<pid>')
+@login_req
+def route_del(pid):
+    delete_peer(pid)
+    flash("Dihapus.", "warning")
+    return redirect(url_for('index'))
+
+@app.route('/get_config/<pid>')
+@login_req
+def route_get_conf(pid):
+    data = load_db()
+    peer = next((p for p in data['peers'] if p['id'] == pid), None)
+    if not peer: return jsonify({'config':'Not Found'})
+    ep = "127.0.0.1" if peer['name'] == LOCAL_CLIENT_NAME else get_public_ip()
+    c = f"[Interface]\nPrivateKey = {peer['private_key']}\nAddress = {peer['ip'].replace('/32','/24')}\nDNS = 8.8.8.8\nMTU = {WG_MTU}\n\n[Peer]\nPublicKey = {data['server_pub']}\nEndpoint = {ep}:{SERVER_PORT}\nAllowedIPs = 10.100.0.0/24\nPersistentKeepalive = 25"
+    return jsonify({'config':c})
+
+@app.route('/download/<pid>')
+@login_req
+def route_dl(pid):
+    data = load_db()
+    peer = next((p for p in data['peers'] if p['id'] == pid), None)
+    if not peer: return "Err", 404
+    ep = "127.0.0.1" if peer['name'] == LOCAL_CLIENT_NAME else get_public_ip()
+    c = f"[Interface]\nPrivateKey = {peer['private_key']}\nAddress = {peer['ip'].replace('/32','/24')}\nDNS = 8.8.8.8\nMTU = {WG_MTU}\n\n[Peer]\nPublicKey = {data['server_pub']}\nEndpoint = {ep}:{SERVER_PORT}\nAllowedIPs = 10.100.0.0/24\nPersistentKeepalive = 25"
+    return Response(c, mimetype='text/plain', headers={"Content-disposition":f"attachment; filename={peer['name']}.conf"})
+
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if request.method=='POST':
+        if request.form.get('username')==ADMIN_USER and request.form.get('password')==ADMIN_PASS:
+            session['logged_in']=True
+            return redirect(url_for('index'))
+        flash("Salah.")
+    return render_template_string(HTML_TEMPLATE, session=session)
+
+@app.route('/logout')
+def logout(): session.clear(); return redirect(url_for('login'))
+
+if __name__ == '__main__':
+    if os.geteuid() != 0: sys.exit("Must use sudo")
+    if not os.path.exists(WG_DIR): os.makedirs(WG_DIR)
+    init_db()
+    apply_wg()
+    print(f"Running on http://{get_public_ip()}:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False)

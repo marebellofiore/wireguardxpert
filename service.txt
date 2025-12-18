@@ -1,0 +1,42 @@
+sudo nano /etc/systemd/system/wgxpert.service
+
+[Unit]
+Description=WireGuard Xpert Manager Service
+After=network.target
+
+[Service]
+# User harus root karena WireGuard & Socat butuh sudo
+User=root
+Group=root
+
+# Lokasi folder script Anda
+WorkingDirectory=/home/xpert
+
+# Perintah menjalankan (Pastikan nama file sesuai!)
+# Jika nama file Anda 'wireemas.py', ubah 'wg_socat_manager.py' jadi 'wireemas.py'
+ExecStart=/usr/bin/python3 /home/xpert/wg_socat_manager.py
+
+# Restart otomatis jika error/crash
+Restart=always
+RestartSec=3
+
+# Output log (Opsional, agar log masuk ke journalctl)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+
+
+*******************
+
+
+# 1. Reload sistem agar mendeteksi service baru
+sudo systemctl daemon-reload
+
+# 2. Aktifkan agar jalan otomatis saat Booting (restart VPS)
+sudo systemctl enable wgxpert
+
+# 3. Jalankan service sekarang
+sudo systemctl start wgxpert

@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+from flask import Flask, request, redirect, session
+import subprocess
+from pathlib import Path
+
+app = Flask(__name__)
+app.secret_key = "socat-secret-key"
+
+LOGIN_USER = "xpert"
+LOGIN_PASS = "16164"
+
+SERVICE_DIR = "/etc/systemd/system"
+SOCAT_BIN = "/usr/bin/socat"
+
+
+# ---------------- UTIL ----------------
+
+def sh(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def ufw_allow(port):
+    sh(["ufw", "allow", f"{port}/tcp"])
+
+
+def ufw_delete(port):
+    sh(["ufw", "delete", "allow", f"{port}/tcp"])
+
+
+def svc_name(port):
+    return f"socat-fwd-{port}.service"
+
+
+def svc_path(port):
+    return Path(SERVICE_DIR) / svc_name(port)
+
+
+def gen_service(port, ip, tport):
+    return f"""[Unit]
+Description=Socat Forward {port} -> {ip}:{tport}
+After=network.target
+
+[Service]
+ExecStart={SOCAT_BIN} TCP-LISTEN:{port},fork TCP:{ip}:{tport}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+# ---------------- CORE ----------------
+
+def list_services():
+    units = subprocess.check_output(
+        ["systemctl", "list-units", "--type=service", "--all", "--no-pager"]
+    ).decode()
+
+    services = []
+    for l in units.splitlines():
+        if "socat-fwd-" in l:
+            name = l.split()[0]
+            port = name.replace("socat-fwd-", "").replace(".service", "")
+            status = "running" if "running" in l else "stopped"
+            services.append((port, status))
+    return sorted(services)
+
+
+def service_target(port):
+    p = svc_path(port)
+    if not p.exists():
+        return "-"
+    for x in p.read_text().splitlines():
+        if x.startswith("ExecStart"):
+            return x.split("TCP:")[1]
+    return "-"
+
+
+# ---------------- AUTH ----------------
+
+def auth():
+    return session.get("ok") is True
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    err = ""
+    if request.method == "POST":
+        if request.form["u"] == LOGIN_USER and request.form["p"] == LOGIN_PASS:
+            session["ok"] = True
+            return redirect("/")
+        err = "Login gagal"
+
+    return f"""
+<body style="background:#020617;color:white;font-family:Arial">
+<div style="width:300px;margin:120px auto;background:#0f172a;padding:20px;border-radius:10px">
+<h3>🔐 xpert ip public emas</h3>
+<form method=post>
+<input name=u placeholder=Username required style="width:100%;padding:8px"><br><br>
+<input name=p type=password placeholder=Password required style="width:100%;padding:8px"><br><br>
+<button style="width:100%;padding:8px;background:#22c55e">Login</button>
+</form>
+<div style="color:red">{err}</div>
+</div>
+</body>
+"""
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
+# ---------------- UI ----------------
+
+@app.route("/")
+def index():
+    if not auth():
+        return redirect("/login")
+
+    rows = ""
+    for port, status in list_services():
+        color = "#22c55e" if status == "running" else "red"
+        target = service_target(port)
+        rows += f"""
+<tr>
+<td>{port}</td>
+<td>{target}</td>
+<td style="color:{color}">{status}</td>
+<td>
+<a href="/act/start/{port}">▶</a>
+<a href="/act/stop/{port}">■</a>
+<a href="/act/restart/{port}">↻</a>
+<a href="/test/ping/{port}">📡</a>
+<a href="/test/port/{port}">🔌</a>
+<a href="/delete/{port}" onclick="return confirm('Delete forward & firewall rule?')">🗑</a>
+</td>
+</tr>
+"""
+
+    return f"""
+<body style="background:#020617;color:white;font-family:Arial">
+<div style="max-width:1000px;margin:40px auto;background:#0f172a;padding:20px;border-radius:10px">
+<h2>🚀 Socat Web Forward + UFW</h2>
+<a href=/logout style="float:right">Logout</a>
+
+<table width=100%>
+<tr><th>LISTEN</th><th>TARGET</th><th>STATUS</th><th>ACTION</th></tr>
+{rows or "<tr><td colspan=4>Empty</td></tr>"}
+</table>
+
+<hr>
+
+<form method=post action=/create>
+<input name=port placeholder="Listen Port" required>
+<input name=ip placeholder="Target IP" required>
+<input name=tport placeholder="Target Port" required>
+<button>Add & Allow</button>
+</form>
+
+</div></body>
+"""
+
+
+# ---------------- ACTIONS ----------------
+
+@app.route("/create", methods=["POST"])
+def create():
+    if not auth():
+        return redirect("/login")
+
+    port = request.form["port"]
+    ip = request.form["ip"]
+    tport = request.form["tport"]
+
+    p = svc_path(port)
+    if not p.exists():
+        p.write_text(gen_service(port, ip, tport))
+        sh(["systemctl", "daemon-reload"])
+        sh(["systemctl", "enable", "--now", svc_name(port)])
+        ufw_allow(port)
+
+    return redirect("/")
+
+
+@app.route("/act/<cmd>/<port>")
+def act(cmd, port):
+    if auth():
+        sh(["systemctl", cmd, svc_name(port)])
+    return redirect("/")
+
+
+@app.route("/delete/<port>")
+def delete(port):
+    if auth():
+        sh(["systemctl", "disable", "--now", svc_name(port)])
+        svc_path(port).unlink(missing_ok=True)
+        sh(["systemctl", "daemon-reload"])
+        ufw_delete(port)
+    return redirect("/")
+
+
+# ---------------- TEST ----------------
+
+@app.route("/test/ping/<port>")
+def ping_test(port):
+    ip = service_target(port).split(":")[0]
+    r = sh(["ping", "-c", "1", "-W", "1", ip])
+    return f"<pre>{r.stdout or r.stderr}</pre><a href=/>Back</a>"
+
+
+@app.route("/test/port/<port>")
+def port_test(port):
+    ip, pt = service_target(port).split(":")
+    r = sh(["nc", "-zv", ip, pt])
+    return f"<pre>{r.stdout or r.stderr}</pre><a href=/>Back</a>"
+
+
+# ---------------- START ----------------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=9000)
+
